@@ -34,6 +34,10 @@ function Reactant.traced_type_inner(
     return RT
 end
 
+function Base.convert(::Type{<:Union{Reactant.TracedRArray, Reactant.RArray}}, p::AbstractFFTs.Plan)
+    return reactant_fftplan(reactant_fftplan_type(typeof(p)), p)
+end
+
 abstract type AbstractReactantFFTPlan{T} <: AbstractFFTs.Plan{T} end
 AbstractFFTs.fftdims(p::AbstractReactantFFTPlan) = p.dims
 
