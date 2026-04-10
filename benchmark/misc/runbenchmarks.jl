@@ -16,6 +16,7 @@ using Printf: @sprintf
 # Include benchmark modules
 include("newton_schulz.jl")
 include("bloch_rf_optimization.jl")
+include("nufft.jl")
 
 # Run all benchmarks
 function run_all_benchmarks(backend::String)
@@ -23,6 +24,7 @@ function run_all_benchmarks(backend::String)
 
     run_newton_schulz_benchmark!(results, backend)
     run_bloch_rf_optimization_benchmark!(results, backend)
+    run_nufft_benchmark!(results, backend)
 
     return results
 end
