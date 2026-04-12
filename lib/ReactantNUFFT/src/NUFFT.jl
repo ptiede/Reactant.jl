@@ -30,26 +30,34 @@ struct MyKernel <: AbstractNUFFTKernel end
 
 and pass an instance with `kernel=MyKernel()`.
 
-A custom kernel must implement:
+A custom kernel only needs to implement:
 
 ```julia
-prepare_kernel(kernel::MyKernel, ::Type{T}, opts::NUFFTOptions) where {T<:Number}
-evaluate_kernel(kernel::MyKernel, dist, kernel_data, opts::NUFFTOptions, ::Type{T}) where {T<:Number}
+kernel_profile(kernel::MyKernel, t, opts::NUFFTOptions)
 ```
 
-`prepare_kernel` is called once per spread/interp call and can precompute lookup
-tables or any other kernel-specific data. Its return value is passed back as
-`kernel_data` to `evaluate_kernel`.
+Here `t` is the normalized distance from the grid point, clipped to `[0, 1]`.
+The NUFFT code automatically zeros the kernel outside its support, so custom
+kernels only need to describe the profile on that interval.
 
-`evaluate_kernel` receives the point-to-grid distances `dist` and must return the
-kernel weights with the same broadcasted shape.
+For performance-sensitive kernels, you can optionally overload `prepare_kernel`
+and `kernel_weights` to precompute lookup tables or use another specialized
+evaluation strategy, but most custom kernels should not need that.
 """
 abstract type AbstractNUFFTKernel end
+
+function kernel_profile end
 
 struct NUPtsDriven <: AbstractNUFFTMethod end
 struct SubProb <: AbstractNUFFTMethod end
 struct OutputDriven <: AbstractNUFFTMethod end
 struct ExpSemicircleKernel <: AbstractNUFFTKernel end
+
+struct PreparedExpSemicircleKernel{A}
+    table::A
+    nspread::Int
+    np::Int
+end
 
 """
     NUFFTOptions{T}
@@ -290,19 +298,19 @@ end
     bases::Tuple{Vararg{<:AbstractVector,D}},
     ngrid::NTuple{D,Int},
     opts::NUFFTOptions,
-    kernel_data,
+    prepared_kernel,
     realT::Type{<:Number},
 ) where {D}
     nspread = opts.nspread
     offset = stencil_offset(stencil_id, nspread, 1)
     lin, wt = dim_stencil(
-        points_scaled[1], bases[1], ngrid[1], offset, opts, kernel_data, realT
+        points_scaled[1], bases[1], ngrid[1], offset, opts, prepared_kernel, realT
     )
     stride = ngrid[1]
     @inbounds for d in 2:D
         offset = stencil_offset(stencil_id, nspread, d)
         idx_d, wt_d = dim_stencil(
-            points_scaled[d], bases[d], ngrid[d], offset, opts, kernel_data, realT
+            points_scaled[d], bases[d], ngrid[d], offset, opts, prepared_kernel, realT
         )
         lin = lin .+ (idx_d .- 1) .* stride
         wt = wt .* wt_d
@@ -321,12 +329,12 @@ function spread_outputdriven(
     CT = unwrapped_eltype(c)
     ncombos = opts.nspread^D
     grid_flat = similar(c, CT, (prod(ngrid),))
-    kernel_data = prepare_kernel(opts.kernel, realT, opts)
+    prepared_kernel = prepare_kernel(opts.kernel, realT, opts)
     bases = ntuple(d -> floor.(Int, points_scaled[d]), Val(D))
 
     @allowscalar @trace for stencil_id in Base.OneTo(ncombos)
         lin, wt = stencil_contribution(
-            stencil_id, points_scaled, bases, ngrid, opts, kernel_data, realT
+            stencil_id, points_scaled, bases, ngrid, opts, prepared_kernel, realT
         )
         scatter_add_flat!(grid_flat, lin, c .* wt)
     end
@@ -343,13 +351,13 @@ function interp_outputdriven(
     ncombos = opts.nspread^D
     grid_flat = vec(grid)
     CT = unwrapped_eltype(grid)
-    kernel_data = prepare_kernel(opts.kernel, realT, opts)
+    prepared_kernel = prepare_kernel(opts.kernel, realT, opts)
     bases = ntuple(d -> floor.(Int, points_scaled[d]), Val(D))
 
     out = similar(grid, CT, (length(points_scaled[1]),))
     @allowscalar @trace for stencil_id in Base.OneTo(ncombos)
         lin, wt = stencil_contribution(
-            stencil_id, points_scaled, bases, ngrid, opts, kernel_data, realT
+            stencil_id, points_scaled, bases, ngrid, opts, prepared_kernel, realT
         )
         copyto!(out, out .+ grid_flat[lin] .* wt)
     end
@@ -362,14 +370,14 @@ function dim_stencil(
     ng::Number,
     offset::Number,
     opts::NUFFTOptions,
-    kernel_data,
+    prepared_kernel,
     ::Type{T},
 ) where {T<:Number}
     ngT = convert_scalar(T, ng)
     idx = mod.(base .+ offset, ng) .+ 1
     dist = abs.(x .- (idx .- 1))
     dist = min.(dist, ngT .- dist)
-    wt = evaluate_kernel(opts.kernel, dist, kernel_data, opts, T)
+    wt = kernel_weights(prepared_kernel, dist, opts)
     return idx, wt
 end
 
@@ -418,13 +426,10 @@ end
 
 function fft_with_iflag(grid::AnyTracedRArray{T,D}, iflag::Integer) where {T,D}
     dims = ntuple(i -> D - i + 1, Val(D))
-    ext = Base.get_extension(Reactant, :ReactantAbstractFFTsExt)
-    ext === nothing &&
-        error("Output-driven NUFFT execution requires loading `AbstractFFTs` or `FFTW`.")
     if iflag < 0
-        return ext.AbstractFFTs.fft(grid, dims)
+        return AbstractFFTs.fft(grid, dims)
     end
-    return ext.AbstractFFTs.bfft(grid, dims)
+    return AbstractFFTs.bfft(grid, dims)
 end
 
 function scatter_add_flat!(
@@ -476,9 +481,20 @@ function expsemicircle_beta(::Type{T}, nspread::Int, upsampfac) where {T<:Number
     return gamma * T(nspread)
 end
 
+prepare_kernel(kernel::AbstractNUFFTKernel, ::Type{<:Number}, ::NUFFTOptions) = kernel
+
+function kernel_weights(kernel::AbstractNUFFTKernel, dist, opts::NUFFTOptions)
+    T = float(real(unwrapped_eltype(dist)))
+    halfwidth = convert_scalar(T, opts.nspread) / T(2)
+    t = dist ./ halfwidth
+    vals = kernel_profile(kernel, clamp.(t, zero(T), one(T)), opts)
+    return ifelse.(t .<= one(T), vals, zero(T))
+end
+
 function prepare_kernel(::ExpSemicircleKernel, ::Type{T}, opts::NUFFTOptions) where {T<:Number}
     beta = expsemicircle_beta(T, opts.nspread, float(opts.upsampfac))
-    return promote_to(TracedRArray{T,1}, expsemicircle_samples(T, beta, opts.np))
+    table = promote_to(TracedRArray{T,1}, expsemicircle_samples(T, beta, opts.np))
+    return PreparedExpSemicircleKernel(table, opts.nspread, opts.np)
 end
 
 function expsemicircle_samples(::Type{T}, beta, np::Int) where {T<:Number}
@@ -487,24 +503,26 @@ function expsemicircle_samples(::Type{T}, beta, np::Int) where {T<:Number}
     return exp.(beta .* (sqrt.(inside) .- one(T)))
 end
 
-function evaluate_kernel(
-    ::ExpSemicircleKernel,
-    dist,
-    kernel_data,
-    opts::NUFFTOptions,
-    ::Type{T},
-) where {T<:Number}
-    halfwidth = convert_scalar(T, opts.nspread) / T(2)
+function kernel_profile(::ExpSemicircleKernel, t, opts::NUFFTOptions)
+    T = float(real(unwrapped_eltype(t)))
+    beta = expsemicircle_beta(T, opts.nspread, float(opts.upsampfac))
+    inside = max.(zero(T), one(T) .- (t .* t))
+    return exp.(beta .* (sqrt.(inside) .- one(T)))
+end
+
+function kernel_weights(kernel::PreparedExpSemicircleKernel, dist, ::NUFFTOptions)
+    T = float(real(unwrapped_eltype(dist)))
+    halfwidth = convert_scalar(T, kernel.nspread) / T(2)
     t = dist ./ halfwidth
     tclip = clamp.(t, zero(T), one(T))
-    npT = convert_scalar(T, opts.np)
+    npT = convert_scalar(T, kernel.np)
     u = tclip .* npT
-    i0 = clamp.(floor.(Int, u) .+ 1, 1, opts.np + 1)
-    i1 = clamp.(i0 .+ 1, 1, opts.np + 1)
+    i0 = clamp.(floor.(Int, u) .+ 1, 1, kernel.np + 1)
+    i1 = clamp.(i0 .+ 1, 1, kernel.np + 1)
     frac = u .- (i0 .- 1)
 
-    v0 = sample_kernel_table(kernel_data, i0)
-    v1 = sample_kernel_table(kernel_data, i1)
+    v0 = sample_kernel_table(kernel.table, i0)
+    v1 = sample_kernel_table(kernel.table, i1)
     vals = (one(T) .- frac) .* v0 .+ frac .* v1
     return ifelse.(t .<= one(T), vals, zero(T))
 end

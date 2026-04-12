@@ -1,7 +1,7 @@
 module ReactantNUFFT
 
+using AbstractFFTs: AbstractFFTs
 using Reactant:
-    Reactant,
     AnyTracedRArray,
     TracedRArray,
     TracedRNumber,
@@ -13,6 +13,7 @@ using Reactant.Ops: @opcall
 
 export AbstractNUFFTMethod,
     AbstractNUFFTKernel,
+    kernel_profile,
     NUPtsDriven,
     SubProb,
     OutputDriven,
