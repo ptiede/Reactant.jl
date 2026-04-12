@@ -63,6 +63,13 @@ to_rpoints(points::NTuple{D,<:AbstractVector}) where {D} =
     plan_typed = NUFFT.plan_nufft(T, 1, (16,); method=NUFFT.SubProb(), nspread=6)
     @test plan_typed.opts.method isa NUFFT.SubProb
 
+    opts = NUFFT.NUFFTOptions(T; method=NUFFT.OutputDriven(), nspread=8, np=64)
+    plan_merged = NUFFT.plan_nufft(T, 1, (16,); opts, eps=T(1.0e-5))
+    @test plan_merged.opts.method isa NUFFT.OutputDriven
+    @test plan_merged.opts.nspread == 8
+    @test plan_merged.opts.np == 64
+    @test plan_merged.opts.eps == T(1.0e-5)
+
     M = 20
     x = rand(T, M) .* T(2 * pi)
     c = randn(Complex{T}, M)
@@ -76,13 +83,25 @@ to_rpoints(points::NTuple{D,<:AbstractVector}) where {D} =
     )
     @test Array(fk_lifecycle) ≈ Array(fk_wrapper)
 
-    plan_t2 = NUFFT.plan_nufft(T, 2, (16,); method=NUFFT.NUPtsDriven(), nspread=6)
+    plan_t2 = NUFFT.plan_nufft(T, 2, (16,); method=NUFFT.OutputDriven(), nspread=6)
     prep_t2 = NUFFT.set_nufft_points(plan_t2, x_ra)
     c_lifecycle = @jit NUFFT.execute_nufft(prep_t2, fk_lifecycle)
     c_wrapper = @jit NUFFT.nufft_type2(
-        (x_ra,), fk_lifecycle; method=NUFFT.NUPtsDriven(), nspread=6
+        (x_ra,), fk_lifecycle; method=NUFFT.OutputDriven(), nspread=6
     )
     @test Array(c_lifecycle) ≈ Array(c_wrapper)
+
+    @test_throws MethodError NUFFT.execute_nufft(
+        NUFFT.set_nufft_points(NUFFT.plan_nufft(T, 1, (16,); method=NUFFT.SubProb()), (x,)),
+        c,
+    )
+    @test_throws MethodError NUFFT.execute_nufft(
+        NUFFT.set_nufft_points(
+            NUFFT.plan_nufft(T, 2, (16,); method=NUFFT.NUPtsDriven()),
+            (x,),
+        ),
+        randn(Complex{T}, 16),
+    )
 
     @test_throws ErrorException NUFFT.nufft_type1(
         (x,), c, (16,); method=NUFFT.OutputDriven(), nspread=6
@@ -114,7 +133,7 @@ end
             points_ra, c_ra, nmodes; nspread=8, method=NUFFT.OutputDriven(), iflag=-1
         )
         c_ra_est = @jit NUFFT.nufft_type2(
-            points_ra, fk_ref_ra; nspread=8, method=NUFFT.SubProb(), iflag=-1
+            points_ra, fk_ref_ra; nspread=8, method=NUFFT.OutputDriven(), iflag=-1
         )
 
         tol_t1 = D == 1 ? 1.2 : D == 2 ? 2.5 : 4.5
@@ -143,10 +162,10 @@ end
         (x_ra,), c_ra, (N,); method=NUFFT.OutputDriven(), nspread=8
     )
     z1 = @jit NUFFT.nufft_type2(
-        (x_ra,), fk_ra; method=NUFFT.NUPtsDriven(), nspread=8
+        (x_ra,), fk_ra; method=NUFFT.OutputDriven(), nspread=8
     )
     z2 = @jit NUFFT.nufft_type2(
-        (x_ra,), fk_ra; method=NUFFT.NUPtsDriven(), nspread=8
+        (x_ra,), fk_ra; method=NUFFT.OutputDriven(), nspread=8
     )
 
     @test size(y1) == (N,)
@@ -202,7 +221,7 @@ if RunningOnCUDA
         c_ra = Reactant.to_rarray(c)
 
         fk_ra = @jit NUFFT.nufft_type1(
-            (x_ra, y_ra), c_ra, nmodes; nspread=8, method=NUFFT.SubProb()
+            (x_ra, y_ra), c_ra, nmodes; nspread=8, method=NUFFT.OutputDriven()
         )
         @test isapprox(Array(fk_ra), fk_ref; atol=3.0, rtol=3.0)
     end

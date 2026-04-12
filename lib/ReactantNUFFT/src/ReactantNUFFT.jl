@@ -23,7 +23,6 @@ export AbstractNUFFTMethod,
     PreparedNUFFTPlan,
     plan_nufft,
     set_nufft_points,
-    set_nufft_points!,
     execute_nufft,
     nufft_type1,
     nufft_type2
