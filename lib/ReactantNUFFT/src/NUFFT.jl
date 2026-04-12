@@ -11,9 +11,15 @@ struct MyMethod <: AbstractNUFFTMethod end
 
 and pass an instance with `method=MyMethod()`.
 
-At the moment this is only a planning/execution tag. Defining a new subtype does
-not change behavior by itself; custom methods also need matching extensions in the
-NUFFT planning or execution code.
+A custom method should implement:
+
+```julia
+execute_type1(method::MyMethod, prep::PreparedNUFFTPlan, c::AbstractVector)
+execute_type2(method::MyMethod, prep::PreparedNUFFTPlan, fk::AbstractArray)
+```
+
+The public `execute_nufft` entry point dispatches through `prep.plan.opts.method`,
+so these overloads are the main extension hook for new execution strategies.
 """
 abstract type AbstractNUFFTMethod end
 
@@ -175,7 +181,7 @@ function set_nufft_points(plan::NUFFTPlan{T,D}, points::NTuple{D,<:AbstractVecto
     nbins = ntuple(d -> max(1, cld(plan.ngrid[d], binsize[d])), Val(D))
 
     points_scaled = ntuple(
-        d -> mod.(points[d], 2 * float(pi)) .* (T(plan.ngrid[d]) / (T(2) * T(pi))),
+        d -> mod.(points[d], 2π) .* (plan.ngrid[d] / (T(2π))),
         Val(D),
     )
     pointbins = point_bins(points_scaled, binsize, nbins)
@@ -184,7 +190,7 @@ function set_nufft_points(plan::NUFFTPlan{T,D}, points::NTuple{D,<:AbstractVecto
     idxnupts = if do_sort
         sortperm(pointbins)
     else
-        Base.OneTo(M)
+        1:M
     end
 
     sortidx = if do_sort
@@ -198,7 +204,7 @@ end
 
 set_nufft_points(plan::NUFFTPlan, x::AbstractVector) = set_nufft_points(plan, (x,))
 set_nufft_points(plan::NUFFTPlan{T,D}, x::AbstractVector, xs::AbstractVector...) where {T,D} =
-    set_nufft_points(plan, tuple(x, xs...))
+    set_nufft_points(plan, (x, xs...))
 set_nufft_points!(plan::NUFFTPlan, points...) = set_nufft_points(plan, points...)
 
 """
@@ -229,13 +235,13 @@ Type-1 NUFFT convenience API.
 function nufft_type1(
     points::NTuple{D,<:AbstractVector},
     c::AbstractVector{<:RComplex},
-    nmodes::NTuple{D,<:Integer};
+    nmodes::Dims{D};
     iflag::Integer=-1,
     kwargs...,
 ) where {D}
     @assert length(c) == length(points[1]) "Strength count must match number of points"
 
-    prep = plan_nufft(points, 1, ntuple(i -> Int(nmodes[i]), D); iflag, kwargs...)
+    prep = plan_nufft(points, 1, nmodes; iflag, kwargs...)
     return execute_nufft(prep, c)
 end
 
@@ -244,7 +250,7 @@ nufft_type1(
     c::AbstractVector,
     nmode::Integer;
     kwargs...,
-) = nufft_type1((x,), c, (Int(nmode),); kwargs...)
+) = nufft_type1((x,), c, (nmode,); kwargs...)
 
 """
     nufft_type2(points, fk; kwargs...)
@@ -257,7 +263,7 @@ function nufft_type2(
     iflag::Integer=-1,
     kwargs...,
 ) where {D}
-    nmodes = ntuple(d -> size(fk, d), D)
+    nmodes = size(fk)
     prep = plan_nufft(points, 2, nmodes; iflag, kwargs...)
     return execute_nufft(prep, fk)
 end
@@ -267,30 +273,41 @@ nufft_type2(x::AbstractVector, fk::AbstractVector; kwargs...) = nufft_type2((x,)
 function execute_type1(prep::PreparedNUFFTPlan, c::AbstractArray)
     @assert ndims(c) == 1 "Type-1 strengths must be a vector"
     @assert length(c) == length(prep.points[1]) "Strength count must match number of points"
-    return execute_outputdriven_type1(prep, c)
+    return execute_type1(prep.plan.opts.method, prep, c)
 end
 
 function execute_type2(prep::PreparedNUFFTPlan, fk::AbstractArray)
     plan = prep.plan
     @assert size(fk) == plan.nmodes "Mode array shape must match plan.nmodes"
-    return execute_outputdriven_type2(prep, fk)
+    return execute_type2(prep.plan.opts.method, prep, fk)
 end
 
-function execute_outputdriven_type1(prep::PreparedNUFFTPlan, c::AbstractVector)
+function execute_type1(::OutputDriven, prep::PreparedNUFFTPlan, c::AbstractVector)
     plan = prep.plan
-    T = typeof(float(plan.opts.eps))
+    T = typeof(plan.opts.eps)
     grid = spread_outputdriven(prep.points_scaled, c, plan.ngrid, plan.opts, T)
     grid_hat = fft_with_iflag(grid, plan.iflag)
     return extract_modes(grid_hat, plan.nmodes, plan.ngrid)
 end
 
-function execute_outputdriven_type2(prep::PreparedNUFFTPlan, fk::AbstractArray)
+execute_type1(::NUPtsDriven, prep::PreparedNUFFTPlan, c::AbstractVector) =
+    execute_type1(OutputDriven(), prep, c)
+
+execute_type1(::SubProb, prep::PreparedNUFFTPlan, c::AbstractVector) =
+    execute_type1(OutputDriven(), prep, c)
+
+function execute_type2(::OutputDriven, prep::PreparedNUFFTPlan, fk::AbstractArray)
     plan = prep.plan
-    T = typeof(float(plan.opts.eps))
     grid_hat = embed_modes(fk, plan.nmodes, plan.ngrid)
     grid = fft_with_iflag(grid_hat, plan.iflag)
-    return interp_outputdriven(prep.points_scaled, grid, plan.ngrid, plan.opts, T)
+    return interp_outputdriven(prep.points_scaled, grid, plan.ngrid, plan.opts)
 end
+
+execute_type2(::NUPtsDriven, prep::PreparedNUFFTPlan, fk::AbstractArray) =
+    execute_type2(OutputDriven(), prep, fk)
+
+execute_type2(::SubProb, prep::PreparedNUFFTPlan, fk::AbstractArray) =
+    execute_type2(OutputDriven(), prep, fk)
 
 @inline function stencil_contribution(
     stencil_id,
@@ -332,7 +349,7 @@ function spread_outputdriven(
     prepared_kernel = prepare_kernel(opts.kernel, realT, opts)
     bases = ntuple(d -> floor.(Int, points_scaled[d]), Val(D))
 
-    @allowscalar @trace for stencil_id in Base.OneTo(ncombos)
+    @allowscalar @trace for stencil_id in 1:ncombos
         lin, wt = stencil_contribution(
             stencil_id, points_scaled, bases, ngrid, opts, prepared_kernel, realT
         )
@@ -346,8 +363,8 @@ function interp_outputdriven(
     grid::AbstractArray,
     ngrid::NTuple{D,Int},
     opts::NUFFTOptions,
-    realT::Type{<:Number},
 ) where {D}
+    realT = typeof(opts.eps)
     ncombos = opts.nspread^D
     grid_flat = vec(grid)
     CT = unwrapped_eltype(grid)
@@ -355,7 +372,7 @@ function interp_outputdriven(
     bases = ntuple(d -> floor.(Int, points_scaled[d]), Val(D))
 
     out = similar(grid, CT, (length(points_scaled[1]),))
-    @allowscalar @trace for stencil_id in Base.OneTo(ncombos)
+    @allowscalar @trace for stencil_id in 1:ncombos
         lin, wt = stencil_contribution(
             stencil_id, points_scaled, bases, ngrid, opts, prepared_kernel, realT
         )
