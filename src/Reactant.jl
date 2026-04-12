@@ -210,7 +210,6 @@ include("TracedRArray.jl")
 include("TracedRange.jl")
 include("TracedRational.jl")
 include("Indexing.jl")
-include("NUFFT.jl")
 
 include("ConcreteRArray.jl")
 
@@ -305,20 +304,7 @@ export ConcreteRArray,
     @code_xla,
     @jit,
     @trace,
-    within_compile,
-    NUFFTOptions,
-    NUFFTPlan,
-    PreparedNUFFTPlan,
-    make_nufft_plan,
-    set_nufft_points,
-    set_nufft_points!,
-    execute_nufft,
-    nufft_type1,
-    nufft_type2,
-    nufft_makeplan,
-    nufft_setpts,
-    nufft_setpts!,
-    nufft_execute
+    within_compile
 
 @static if VERSION ≥ v"1.11"
     @eval $(Expr(:public, :Periodic))

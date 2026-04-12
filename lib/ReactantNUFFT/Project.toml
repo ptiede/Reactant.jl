@@ -1,0 +1,21 @@
+name = "ReactantNUFFT"
+uuid = "63135c37-b44d-4991-9415-ad76a921569b"
+version = "0.1.0"
+
+[deps]
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+
+[sources]
+Reactant = {path = "../.."}
+
+[compat]
+Reactant = "0.2.248"
+julia = "1.10"
+
+[extras]
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["FFTW", "Random", "Test"]
