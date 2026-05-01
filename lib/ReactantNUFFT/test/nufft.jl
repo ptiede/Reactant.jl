@@ -12,280 +12,163 @@ catch
     false
 end
 
-centered_mode(i::Integer, n::Integer) = i - div(n, 2) - 1
+# --- helpers ----------------------------------------------------------------
 
-function direct_type1(points::NTuple{D,<:AbstractVector}, c, nmodes; iflag=-1) where {D}
-    T = float(real(eltype(c)))
-    out = zeros(eltype(c), nmodes)
-    for I in CartesianIndices(out)
-        mode = ntuple(d -> centered_mode(I[d], nmodes[d]), D)
-        acc = zero(eltype(c))
-        for j in eachindex(c)
-            phase = zero(T)
-            for d in 1:D
-                phase += T(mode[d]) * points[d][j]
-            end
-            acc += c[j] * cis(T(iflag) * phase)
-        end
-        out[I] = acc
+# Brute-force reference using the package's own implementation (which lives
+# in non-traced Julia).
+brute_type1 = ReactantNUFFT.direct_type1
+brute_type2 = ReactantNUFFT.direct_type2
+
+# Tolerance scaled to the requested eps + a margin for kernel/quadrature error
+# and accumulated Float32 round-off. The bound is loose enough for F32 at
+# eps=1e-6 in 3D while still catching gross algorithmic mistakes.
+tolerance(eps_target, D, T=Float32) = max(eps_target * 500 * D, T === Float32 ? 5e-4 : 1e-9)
+
+# --- Type-1 correctness -----------------------------------------------------
+
+@testset "Type-1 correctness D=$D T=$T eps=$eps_target iflag=$iflag" for
+    D in 1:3,
+    T in (Float32, Float64),
+    eps_target in (1e-3, 1e-6),
+    iflag in (-1, +1)
+
+    if T === Float32 && eps_target < 1e-6
+        continue
     end
-    return out
-end
 
-function direct_type2(points::NTuple{D,<:AbstractVector}, fk; iflag=-1) where {D}
-    T = float(real(eltype(fk)))
-    out = zeros(eltype(fk), length(points[1]))
-    nmodes = size(fk)
-    for j in eachindex(out)
-        acc = zero(eltype(fk))
-        for I in CartesianIndices(fk)
-            mode = ntuple(d -> centered_mode(I[d], nmodes[d]), D)
-            phase = zero(T)
-            for d in 1:D
-                phase += T(mode[d]) * points[d][j]
-            end
-            acc += fk[I] * cis(T(iflag) * phase)
-        end
-        out[j] = acc
-    end
-    return out
-end
+    Random.seed!(0xCAFE + D + Int(round(-log10(eps_target))))
+    M = 32
+    nmodes = D == 1 ? (24,) : D == 2 ? (12, 10) : (8, 6, 10)
+    pts = ntuple(_ -> T.(2π .* rand(M)), D)
+    c = Complex{T}.(randn(Complex{T}, M))
 
-to_rpoints(points::NTuple{D,<:AbstractVector}) where {D} =
-    ntuple(d -> Reactant.to_rarray(points[d]), D)
-
-struct WrappedMethod <: NUFFT.AbstractNUFFTMethod end
-
-NUFFT.spread_to_grid(::WrappedMethod, prep::NUFFT.PreparedNUFFTPlan, c::AbstractVector, kernel) =
-    NUFFT.spread_to_grid(NUFFT.NUPtsDriven(), prep, c, kernel)
-
-NUFFT.interp_from_grid(
-    ::WrappedMethod, prep::NUFFT.PreparedNUFFTPlan, grid::AbstractArray, kernel
-) = NUFFT.interp_from_grid(NUFFT.OutputDriven(), prep, grid, kernel)
-
-@testset "NUFFT Lifecycle and Method Types" begin
-    T = Float32
-    plan_default = NUFFT.plan_nufft(T, 1, (16,); method=NUFFT.OutputDriven(), nspread=6)
-    @test plan_default.opts.method isa NUFFT.OutputDriven
-    @test plan_default.opts.kernel isa NUFFT.ExpSemicircleKernel
-
-    plan_nupts = NUFFT.plan_nufft(T, 1, (16,); method=NUFFT.NUPtsDriven(), nspread=6)
-    @test plan_nupts.opts.method isa NUFFT.NUPtsDriven
-
-    plan_auto = NUFFT.plan_nufft(T, 1, (16,); method=NUFFT.AutoMethod(), nspread=6)
-    @test plan_auto.opts.method isa NUFFT.AutoMethod
-
-    plan_wrapped = NUFFT.plan_nufft(T, 1, (16,); method=WrappedMethod(), nspread=6)
-    @test plan_wrapped.opts.method isa WrappedMethod
-
-    opts = NUFFT.NUFFTOptions(T; method=NUFFT.OutputDriven(), nspread=8, np=64)
-    plan_merged = NUFFT.plan_nufft(T, 1, (16,); opts, eps=T(1.0e-5))
-    @test plan_merged.opts.method isa NUFFT.OutputDriven
-    @test plan_merged.opts.nspread == 8
-    @test plan_merged.opts.np == 64
-    @test plan_merged.opts.eps == T(1.0e-5)
-
-    M = 20
-    x = rand(T, M) .* T(2 * pi)
-    c = randn(Complex{T}, M)
-    x_ra = Reactant.to_rarray(x)
+    fk_ref = brute_type1(pts, c, nmodes; iflag=iflag)
+    pts_ra = ntuple(d -> Reactant.to_rarray(pts[d]), D)
     c_ra = Reactant.to_rarray(c)
+    fk = Reactant.@jit nufft_type1(pts_ra, c_ra, nmodes; iflag=iflag, eps=eps_target)
 
-    prep = NUFFT.set_nufft_points(plan_default, x_ra)
-    fk_lifecycle = @jit NUFFT.execute_nufft(prep, c_ra)
-    fk_wrapper = @jit NUFFT.nufft_type1(
-        (x_ra,), c_ra, (16,); method=NUFFT.OutputDriven(), nspread=6
-    )
-    @test Array(fk_lifecycle) ≈ Array(fk_wrapper)
-
-    plan_t2 = NUFFT.plan_nufft(T, 2, (16,); method=NUFFT.OutputDriven(), nspread=6)
-    prep_t2 = NUFFT.set_nufft_points(plan_t2, x_ra)
-    c_lifecycle = @jit NUFFT.execute_nufft(prep_t2, fk_lifecycle)
-    c_wrapper = @jit NUFFT.nufft_type2(
-        (x_ra,), fk_lifecycle; method=NUFFT.OutputDriven(), nspread=6
-    )
-    @test Array(c_lifecycle) ≈ Array(c_wrapper)
-
-    fk_nupts = @jit NUFFT.nufft_type1(
-        (x_ra,), c_ra, (16,); method=NUFFT.NUPtsDriven(), nspread=6
-    )
-    fk_auto = @jit NUFFT.nufft_type1(
-        (x_ra,), c_ra, (16,); method=NUFFT.AutoMethod(), nspread=6
-    )
-    fk_wrapped = @jit NUFFT.nufft_type1(
-        (x_ra,), c_ra, (16,); method=WrappedMethod(), nspread=6
-    )
-    c_nupts = @jit NUFFT.nufft_type2(
-        (x_ra,), fk_lifecycle; method=NUFFT.NUPtsDriven(), nspread=6
-    )
-    c_auto = @jit NUFFT.nufft_type2(
-        (x_ra,), fk_lifecycle; method=NUFFT.AutoMethod(), nspread=6
-    )
-    c_wrapped = @jit NUFFT.nufft_type2(
-        (x_ra,), fk_lifecycle; method=WrappedMethod(), nspread=6
-    )
-    @test Array(fk_nupts) ≈ Array(fk_wrapper)
-    @test Array(fk_auto) ≈ Array(fk_wrapper)
-    @test Array(fk_wrapped) ≈ Array(fk_wrapper)
-    @test Array(c_nupts) ≈ Array(c_wrapper)
-    @test Array(c_auto) ≈ Array(c_wrapper)
-    @test Array(c_wrapped) ≈ Array(c_wrapper)
-
-    @test NUFFT.resolve_auto_method(1, prep) isa NUFFT.NUPtsDriven
-    @test NUFFT.resolve_auto_method(2, prep) isa NUFFT.OutputDriven
-
-    y = rand(T, M) .* T(2 * pi)
-    y_ra = Reactant.to_rarray(y)
-    prep_2d = NUFFT.set_nufft_points(
-        NUFFT.plan_nufft(T, 2, (12, 10); method=NUFFT.AutoMethod(), nspread=6),
-        (x_ra, y_ra),
-    )
-    @test NUFFT.resolve_auto_method(1, prep_2d) isa NUFFT.OutputDriven
-    @test NUFFT.resolve_auto_method(2, prep_2d) isa NUFFT.OutputDriven
-
-    z = rand(T, M) .* T(2 * pi)
-    z_ra = Reactant.to_rarray(z)
-    prep_3d = NUFFT.set_nufft_points(
-        NUFFT.plan_nufft(T, 2, (12, 10, 8); method=NUFFT.AutoMethod(), nspread=6),
-        (x_ra, y_ra, z_ra),
-    )
-    @test NUFFT.resolve_auto_method(1, prep_3d) isa NUFFT.NUPtsDriven
-    @test NUFFT.resolve_auto_method(2, prep_3d) isa NUFFT.OutputDriven
-
-    @test_throws ErrorException NUFFT.nufft_type1(
-        (x,), c, (16,); method=NUFFT.OutputDriven(), nspread=6
-    )
-    @test_throws ErrorException NUFFT.nufft_type2(
-        (x,), randn(Complex{T}, 16); method=NUFFT.OutputDriven(), nspread=6
-    )
+    @test size(fk) == nmodes
+    rel_err = maximum(abs.(Array(fk) .- fk_ref)) / maximum(abs.(fk_ref))
+    @test rel_err < tolerance(eps_target, D, T)
 end
 
-@testset "NUFFT Correctness 1D/2D/3D" begin
-    Random.seed!(1234)
+# --- Type-2 correctness -----------------------------------------------------
+
+@testset "Type-2 correctness D=$D T=$T eps=$eps_target iflag=$iflag" for
+    D in 1:3,
+    T in (Float32, Float64),
+    eps_target in (1e-3, 1e-6),
+    iflag in (-1, +1)
+
+    if T === Float32 && eps_target < 1e-6
+        continue
+    end
+
+    Random.seed!(0xBEAD + D + Int(round(-log10(eps_target))))
+    M = 32
+    nmodes = D == 1 ? (24,) : D == 2 ? (12, 10) : (8, 6, 10)
+    pts = ntuple(_ -> T.(2π .* rand(M)), D)
+    fk = Complex{T}.(randn(Complex{T}, nmodes...))
+
+    c_ref = brute_type2(pts, fk; iflag=iflag)
+    pts_ra = ntuple(d -> Reactant.to_rarray(pts[d]), D)
+    fk_ra = Reactant.to_rarray(fk)
+    c = Reactant.@jit nufft_type2(pts_ra, fk_ra; iflag=iflag, eps=eps_target)
+
+    @test size(c) == (M,)
+    rel_err = maximum(abs.(Array(c) .- c_ref)) / maximum(abs.(c_ref))
+    @test rel_err < tolerance(eps_target, D, T)
+end
+
+# --- Batched (ntrans>1) -----------------------------------------------------
+
+@testset "Type-1 batched ntrans D=$D ntrans=$ntrans" for D in 1:3, ntrans in (1, 4)
+    Random.seed!(0xF00D + D + ntrans)
     T = Float32
+    M = 24
+    nmodes = D == 1 ? (16,) : D == 2 ? (8, 8) : (6, 5, 4)
+    pts = ntuple(_ -> T.(2π .* rand(M)), D)
+    C = Complex{T}.(randn(Complex{T}, M, ntrans))
 
-    cases = ((24, (20,)), (20, (12, 10)), (16, (8, 6, 10)))
-    methods = (
-        NUFFT.OutputDriven(),
-        NUFFT.NUPtsDriven(),
-        NUFFT.AutoMethod(),
-    )
+    pts_ra = ntuple(d -> Reactant.to_rarray(pts[d]), D)
+    C_ra = Reactant.to_rarray(C)
+    FK = Reactant.@jit nufft_type1(pts_ra, C_ra, nmodes; iflag=-1, eps=1e-6)
+    @test size(FK) == (nmodes..., ntrans)
 
-    for method in methods
-        for (M, nmodes) in cases
-            D = length(nmodes)
-            points = ntuple(_ -> rand(T, M) .* T(2 * pi), D)
-            c = randn(Complex{T}, M)
-
-            fk_ref = direct_type1(points, c, nmodes; iflag=-1)
-            c_ref = direct_type2(points, fk_ref; iflag=-1)
-
-            points_ra = to_rpoints(points)
-            c_ra = Reactant.to_rarray(c)
-            fk_ref_ra = Reactant.to_rarray(fk_ref)
-
-            fk_ra = @jit NUFFT.nufft_type1(
-                points_ra, c_ra, nmodes; nspread=8, method, iflag=-1
-            )
-            c_ra_est = @jit NUFFT.nufft_type2(
-                points_ra, fk_ref_ra; nspread=8, method, iflag=-1
-            )
-
-            tol_t1 = D == 1 ? 1.2 : D == 2 ? 2.5 : 4.5
-            tol_t2 = D == 1 ? 2.0 : D == 2 ? 4.0 : 7.0
-            @test isapprox(Array(fk_ra), fk_ref; atol=tol_t1, rtol=tol_t1)
-            @test isapprox(Array(c_ra_est), c_ref; atol=tol_t2, rtol=tol_t2)
-        end
+    for t in 1:ntrans
+        fk_ref = brute_type1(pts, C[:, t], nmodes; iflag=-1)
+        slice = ntuple(d -> Colon(), D)
+        rel_err = maximum(abs.(Array(FK)[slice..., t] .- fk_ref)) / maximum(abs.(fk_ref))
+        @test rel_err < tolerance(1e-6, D, T)
     end
 end
 
-@testset "NUFFT Dispatch Regression (@jit)" begin
+@testset "Type-2 batched ntrans D=$D ntrans=$ntrans" for D in 1:3, ntrans in (1, 4)
+    Random.seed!(0xB10B + D + ntrans)
+    T = Float32
+    M = 24
+    nmodes = D == 1 ? (16,) : D == 2 ? (8, 8) : (6, 5, 4)
+    pts = ntuple(_ -> T.(2π .* rand(M)), D)
+    FK = Complex{T}.(randn(Complex{T}, nmodes..., ntrans))
+
+    pts_ra = ntuple(d -> Reactant.to_rarray(pts[d]), D)
+    FK_ra = Reactant.to_rarray(FK)
+    C = Reactant.@jit nufft_type2(pts_ra, FK_ra; iflag=-1, eps=1e-6)
+    @test size(C) == (M, ntrans)
+
+    for t in 1:ntrans
+        slice = ntuple(d -> Colon(), D)
+        c_ref = brute_type2(pts, FK[slice..., t]; iflag=-1)
+        rel_err = maximum(abs.(Array(C)[:, t] .- c_ref)) / maximum(abs.(c_ref))
+        @test rel_err < tolerance(1e-6, D, T)
+    end
+end
+
+# --- Plan + setpts + execute reuse ------------------------------------------
+
+@testset "Plan reuse: same points, multiple strengths" begin
     T = Float32
     M = 16
-    N = 12
-    x = rand(T, M) .* T(2 * pi)
-    c = randn(Complex{T}, M)
-    fk = randn(Complex{T}, N)
+    nmodes = (8, 8)
+    pts = ntuple(_ -> T.(2π .* rand(M)), 2)
+    pts_ra = ntuple(d -> Reactant.to_rarray(pts[d]), 2)
 
-    x_ra = Reactant.to_rarray(x)
-    c_ra = Reactant.to_rarray(c)
-    fk_ra = Reactant.to_rarray(fk)
+    plan = plan_nufft(T, 1, nmodes; iflag=-1, eps=1e-6)
+    prep = Reactant.@jit set_nufft_points(plan, pts_ra)
+    @test prep isa NUFFTSetPts{T,2}
 
-    methods = (
-        NUFFT.OutputDriven(),
-        NUFFT.NUPtsDriven(),
-        NUFFT.AutoMethod(),
-    )
-
-    for method in methods
-        y1 = @jit NUFFT.nufft_type1((x_ra,), c_ra, (N,); method, nspread=8)
-        y2 = @jit NUFFT.nufft_type1((x_ra,), c_ra, (N,); method, nspread=8)
-        z1 = @jit NUFFT.nufft_type2((x_ra,), fk_ra; method, nspread=8)
-        z2 = @jit NUFFT.nufft_type2((x_ra,), fk_ra; method, nspread=8)
-
-        @test size(y1) == (N,)
-        @test size(y2) == (N,)
-        @test size(z1) == (M,)
-        @test size(z2) == (M,)
-    end
-end
-
-@testset "NUFFT HLO Sanity" begin
-    T = Float32
-    M = 12
-    N = 10
-    x = rand(T, M) .* T(2 * pi)
-    c = randn(Complex{T}, M)
-    fk = randn(Complex{T}, N)
-
-    x_ra = Reactant.to_rarray(x)
-    c_ra = Reactant.to_rarray(c)
-    fk_ra = Reactant.to_rarray(fk)
-
-    hlo_output_t1 = repr(
-        @code_hlo NUFFT.nufft_type1(
-            (x_ra,), c_ra, (N,); nspread=6, method=NUFFT.OutputDriven()
-        )
-    )
-    hlo_nupts_t2 = repr(
-        @code_hlo NUFFT.nufft_type2(
-            (x_ra,), fk_ra; nspread=6, method=NUFFT.NUPtsDriven()
-        )
-    )
-    hlo_auto_t2 = repr(
-        @code_hlo NUFFT.nufft_type2(
-            (x_ra,), fk_ra; nspread=6, method=NUFFT.AutoMethod()
-        )
-    )
-
-    @test occursin("stablehlo.scatter", hlo_output_t1) || occursin("stablehlo.dynamic_update_slice", hlo_output_t1)
-    @test !occursin("julia_callback", hlo_output_t1)
-
-    @test occursin("stablehlo.gather", hlo_nupts_t2)
-    @test !occursin("julia_callback", hlo_nupts_t2)
-    @test occursin("stablehlo.gather", hlo_auto_t2)
-    @test !occursin("julia_callback", hlo_auto_t2)
-end
-
-if RunningOnCUDA
-    @testset "NUFFT CUDA @jit Coverage" begin
-        T = Float32
-        M = 14
-        nmodes = (10, 8)
-
-        x = rand(T, M) .* T(2 * pi)
-        y = rand(T, M) .* T(2 * pi)
-        c = randn(Complex{T}, M)
-
-        fk_ref = direct_type1((x, y), c, nmodes)
-
-        x_ra = Reactant.to_rarray(x)
-        y_ra = Reactant.to_rarray(y)
+    for trial in 1:3
+        c = Complex{T}.(randn(Complex{T}, M))
         c_ra = Reactant.to_rarray(c)
-
-        fk_ra = @jit NUFFT.nufft_type1(
-            (x_ra, y_ra), c_ra, nmodes; nspread=8, method=NUFFT.OutputDriven()
-        )
-        @test isapprox(Array(fk_ra), fk_ref; atol=3.0, rtol=3.0)
+        fk = Reactant.@jit execute_nufft(prep, c_ra)
+        fk_ref = brute_type1(pts, c, nmodes; iflag=-1)
+        rel_err = maximum(abs.(Array(fk) .- fk_ref)) / maximum(abs.(fk_ref))
+        @test rel_err < 5e-4
     end
+end
+
+# --- HLO sanity -------------------------------------------------------------
+
+@testset "Compiled IR contains scatter / gather / fft" begin
+    T = Float32
+    M = 8
+    nmodes = (16,)
+    pts = ntuple(_ -> T.(2π .* rand(M)), 1)
+    c = Complex{T}.(randn(Complex{T}, M))
+    pts_ra = ntuple(d -> Reactant.to_rarray(pts[d]), 1)
+    c_ra = Reactant.to_rarray(c)
+
+    plan = plan_nufft(T, 1, nmodes; eps=1e-6)
+    prep = Reactant.@jit set_nufft_points(plan, pts_ra)
+    hlo_t1 = sprint(io -> show(io, Reactant.@code_hlo execute_nufft(prep, c_ra)))
+    @test occursin("stablehlo.scatter", hlo_t1)
+    @test occursin("stablehlo.fft", hlo_t1)
+
+    fk = Complex{T}.(randn(Complex{T}, nmodes...))
+    fk_ra = Reactant.to_rarray(fk)
+    plan2 = plan_nufft(T, 2, nmodes; eps=1e-6)
+    prep2 = Reactant.@jit set_nufft_points(plan2, pts_ra)
+    hlo_t2 = sprint(io -> show(io, Reactant.@code_hlo execute_nufft(prep2, fk_ra)))
+    @test occursin("stablehlo.gather", hlo_t2)
+    @test occursin("stablehlo.fft", hlo_t2)
 end

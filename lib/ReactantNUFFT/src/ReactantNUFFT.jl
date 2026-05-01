@@ -1,31 +1,20 @@
 module ReactantNUFFT
 
 using AbstractFFTs: AbstractFFTs
-using Reactant:
-    AnyTracedRArray,
-    TracedRArray,
-    TracedRNumber,
-    unwrapped_eltype,
-    promote_to,
-    @trace,
-    @allowscalar
-using Reactant.Ops: @opcall
+using LinearAlgebra: LinearAlgebra
+using Reactant: Reactant
+using ReactantCore: @trace
 
-export AbstractNUFFTMethod,
-    AbstractNUFFTKernel,
-    kernel_profile,
-    NUPtsDriven,
-    OutputDriven,
-    AutoMethod,
-    ExpSemicircleKernel,
-    NUFFTOptions,
+export NUFFTOptions,
     NUFFTPlan,
-    PreparedNUFFTPlan,
+    NUFFTSetPts,
     plan_nufft,
     set_nufft_points,
     execute_nufft,
     nufft_type1,
-    nufft_type2
+    nufft_type2,
+    direct_type1,
+    direct_type2
 
 include("NUFFT.jl")
 
