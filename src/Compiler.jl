@@ -218,9 +218,9 @@ function traced_setfield_buffer!(
     return traced_setfield!(obj, field, cval, path)
 end
 
-function create_result(
-    tocopy::T,
-    path,
+Base.@nospecializeinfer function create_result(
+    @nospecialize(tocopy),
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -230,10 +230,12 @@ function create_result(
     result_cache,
     var_idx,
     resultgen_code,
-) where {T}
+)
     if !isstructtype(typeof(tocopy))
         error("cannot copy $tocopy of type $(Core.Typeof(tocopy))")
     end
+
+    T = Core.Typeof(tocopy)
 
     args = (
         result_stores,
@@ -275,9 +277,40 @@ function create_result(
     return result_cache[tocopy]
 end
 
+Base.@nospecializeinfer function create_result(
+    @nospecialize(tocopy::Enum),
+    @nospecialize(path::Tuple),
+    result_stores,
+    path_to_shard_info,
+    to_unreshard_results,
+    _unresharded_code::Vector{Expr},
+    _unresharded_arrays_cache,
+    used_shardinfo,
+    result_cache,
+    var_idx,
+    resultgen_code,
+)
+    if !haskey(result_cache, tocopy)
+        sym = Symbol("result", var_idx[])
+        var_idx[] += 1
+
+        result = Meta.quot(tocopy)
+
+        push!(
+            resultgen_code,
+            quote
+                $sym = $result
+            end,
+        )
+        result_cache[tocopy] = sym
+    end
+
+    return result_cache[tocopy]
+end
+
 function create_result(
     tocopy::ConcretePJRTNumber{T,D},
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -319,7 +352,7 @@ end
 
 function create_result(
     tocopy::ConcreteIFRTNumber{T},
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -361,7 +394,7 @@ end
 
 function create_result(
     tocopy::ConcretePJRTArray{T,N,D},
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -404,7 +437,7 @@ end
 
 function create_result(
     tocopy::ConcreteIFRTArray{T,N},
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -490,7 +523,7 @@ end
 
 function create_result(
     tocopy::Array{T,N},
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -542,7 +575,7 @@ end
 
 function create_result(
     tocopy::Tuple,
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -573,7 +606,7 @@ end
 
 function create_result(
     tocopy::NamedTuple{K,T},
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -604,7 +637,7 @@ end
 
 function create_result(
     tocopy::D,
-    path,
+    @nospecialize(path::Tuple),
     result_stores,
     path_to_shard_info,
     to_unreshard_results,
@@ -661,7 +694,7 @@ end
 
 function create_result(
     tocopy::Reactant.XLA.AbstractDevice,
-    _path,
+    @nospecialize(_path::Tuple),
     _result_stores,
     _path_to_shard_info,
     _to_unreshard_results,
@@ -677,7 +710,7 @@ end
 
 function create_result(
     tocopy::Union{Integer,AbstractFloat,AbstractString,Nothing,Type,Symbol,Char},
-    _path,
+    @nospecialize(_path::Tuple),
     _result_stores,
     _path_to_shard_info,
     _to_unreshard_results,
@@ -760,6 +793,13 @@ function optimization_passes(
     lower_passes_str = unsafe_string(lower_passes_ptr[])
     MLIR.API.enzymexlaFreeTransformPassesList(main_passes_ptr[])
     MLIR.API.enzymexlaFreeTransformPassesList(lower_passes_ptr[])
+    main_passes_str = replace(main_passes_str, "convert_mul_convert;" => "")
+    lower_passes_str = replace(lower_passes_str, "convert_mul_convert;" => "")
+
+    main_passes_str = replace(main_passes_str, "associative_binary_op_reordering<1>;" => "")
+    lower_passes_str = replace(
+        lower_passes_str, "associative_binary_op_reordering<1>;" => ""
+    )
 
     transform_passes = join(
         [
@@ -814,14 +854,14 @@ end
 # However, this errs as we cannot attach the transform with to the funcop itself [as we run a functionpass].
 const enzyme_pass::String = "enzyme{postpasses=\"arith-raise{stablehlo=true},canonicalize,cse,canonicalize,remove-unnecessary-enzyme-ops,enzyme-simplify-math,canonicalize,cse,canonicalize,arith-raise{stablehlo=true}\"}"
 
-function probprog_pass(;
+function impulse_pass(;
     debug_dump::Bool=DEBUG_PROBPROG_DUMP_VALUE[],
     disable_optimizations::Bool=DEBUG_PROBPROG_DISABLE_OPT[],
 )
     if !disable_optimizations
-        # TODO(#2063): Add probprog optimization passes
+        # TODO(#2063): Add impulse optimization passes
     end
-    return "probprog{debug-dump=$debug_dump postpasses=\"arith-raise{stablehlo=true}\"}"
+    return "expand-impulse{debug-dump=$debug_dump postpasses=\"arith-raise{stablehlo=true}\"}"
 end
 
 function run_pass_pipeline!(mod, pass_pipeline, key=""; enable_verifier=true)
@@ -1566,8 +1606,8 @@ function compile_mlir!(
                         raise_passes,
                         "enzyme-batch",
                         opt_passes2,
-                        probprog_pass(),
-                        "lower-probprog-to-stablehlo{backend=$backend}",
+                        impulse_pass(),
+                        "lower-impulse-to-stablehlo{backend=$backend}",
                         "outline-enzyme-regions",
                         enzyme_pass,
                         opt_passes2,
@@ -1583,7 +1623,7 @@ function compile_mlir!(
                         )...,
                         opt_passes2,
                         lower_enzymexla_passes,
-                        "lower-probprog-trace-ops{backend=$backend}",
+                        "lower-impulse-trace-ops{backend=$backend}",
                         jit,
                     ]
                 else
@@ -1592,8 +1632,8 @@ function compile_mlir!(
                         opt_passes,
                         "enzyme-batch",
                         opt_passes2,
-                        probprog_pass(),
-                        "lower-probprog-to-stablehlo{backend=$backend}",
+                        impulse_pass(),
+                        "lower-impulse-to-stablehlo{backend=$backend}",
                         "outline-enzyme-regions",
                         enzyme_pass,
                         opt_passes2,
@@ -1611,13 +1651,13 @@ function compile_mlir!(
                         kern,
                         raise_passes,
                         lower_enzymexla_passes,
-                        "lower-probprog-trace-ops{backend=$backend}",
+                        "lower-impulse-trace-ops{backend=$backend}",
                         jit,
                     ]
                 end,
                 ",",
             ),
-            "probprog",
+            "impulse",
         )
     elseif compile_options.optimization_passes === :only_enzyme
         run_pass_pipeline!(
