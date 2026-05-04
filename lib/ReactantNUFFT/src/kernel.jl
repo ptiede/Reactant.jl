@@ -60,10 +60,10 @@ function _fit_monomial(::Type{T}, fvals::AbstractVector{T}, nodes::AbstractVecto
     @assert length(fvals) == n
     # Vandermonde: V[i, j] = nodes[i]^(j-1)
     V = Matrix{T}(undef, n, n)
-    @inbounds for i in 1:n
+    @inbounds for i in axes(V, 2)
         x = nodes[i]
         v = one(T)
-        for j in 1:n
+        for j in axes(V, 1)
             V[i, j] = v
             v *= x
         end
@@ -160,7 +160,7 @@ function phi_hat_1d(
     out = Vector{T}(undef, nmodes_d)
     inv_alpha = T(pi) * T(w) / T(Nf)            # = pi*w/Nf
     prefactor = T(w) / T(2)
-    @inbounds for i in 1:nmodes_d
+    @inbounds for i in eachindex(out)
         m = T(i - 1 - half)
         s = zero(T)
         ang = inv_alpha * m

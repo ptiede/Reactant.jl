@@ -2,7 +2,7 @@ module ReactantNUFFT
 
 using AbstractFFTs: AbstractFFTs
 using LinearAlgebra: LinearAlgebra
-using Reactant: Reactant
+using Reactant: Reactant, @allowscalar
 using ReactantCore: @trace
 
 export NUFFTOptions,
@@ -11,6 +11,7 @@ export NUFFTOptions,
     plan_nufft,
     set_nufft_points,
     execute_nufft,
+    execute_nufft!,
     nufft_type1,
     nufft_type2,
     direct_type1,

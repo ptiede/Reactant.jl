@@ -86,6 +86,17 @@ function execute_nufft(prep::NUFFTSetPts, data::AbstractArray)
     end
 end
 
+"""
+    execute_nufft!(out, prep::NUFFTSetPts, data) -> out
+
+In-place version of `execute_nufft`. Use this if you want to reuse the same output array for multiple calls.
+"""
+function execute_nufft!(out::AbstractArray, prep::NUFFTSetPts, data::AbstractArray)
+    tmp = execute_nufft(prep, data)
+    copyto!(out, tmp)
+    return out
+end
+
 # --------------------- convenience wrappers ---------------------------------
 
 # 1D varargs convenience

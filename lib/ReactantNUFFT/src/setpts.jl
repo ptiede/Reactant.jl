@@ -90,20 +90,20 @@ function _pad_for_chunks(
     perm, base_s::NTuple{D,Any}, frac_s::NTuple{D,Any},
     M::Int, M_pad::Int, ::Type{T}, ::Val{D},
 ) where {T,D}
+    one_T = Reactant.promote_to(Reactant.TracedRNumber{T}, one(T))
     if M_pad == M
-        mask = Reactant.Ops.@opcall fill(one(T), Int64[M_pad])
-        return perm, base_s, frac_s, mask
+        return perm, base_s, frac_s, fill(one_T, M_pad)
     end
     npad = M_pad - M
-    pad_perm = Reactant.Ops.@opcall fill(Int64(1), Int64[npad])
-    pad_int  = Reactant.Ops.@opcall fill(Int64(1), Int64[npad])
-    pad_T    = Reactant.Ops.@opcall fill(zero(T), Int64[npad])
+    one_I  = Reactant.promote_to(Reactant.TracedRNumber{Int}, Int(1))
+    zero_T = Reactant.promote_to(Reactant.TracedRNumber{T},     zero(T))
+    pad_perm = fill(one_I,  npad)
+    pad_int  = fill(one_I,  npad)
+    pad_T    = fill(zero_T, npad)
     perm_p = vcat(perm, pad_perm)
     base_p = ntuple(d -> vcat(base_s[d], pad_int), Val(D))
     frac_p = ntuple(d -> vcat(frac_s[d], pad_T),   Val(D))
-    ones_T = Reactant.Ops.@opcall fill(one(T),  Int64[M])
-    zeros_T = Reactant.Ops.@opcall fill(zero(T), Int64[npad])
-    mask = vcat(ones_T, zeros_T)
+    mask = vcat(fill(one_T, M), fill(zero_T, npad))
     return perm_p, base_p, frac_p, mask
 end
 
