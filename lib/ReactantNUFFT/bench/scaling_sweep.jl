@@ -20,6 +20,7 @@ using ReactantNUFFT
 backend = "gpu"
 dtype = "f32"
 out_path = "/tmp/scaling.csv"
+sweep_size = "full"     # "full" or "small" (M ≤ 1e5, N ≤ 1024 per axis)
 for a in ARGS
     if startswith(a, "--backend=")
         global backend = String(split(a, "=")[2])
@@ -27,10 +28,13 @@ for a in ARGS
         global dtype = lowercase(String(split(a, "=")[2]))
     elseif startswith(a, "--out=")
         global out_path = String(split(a, "=")[2])
+    elseif a == "--small"
+        global sweep_size = "small"
     end
 end
 Reactant.set_default_backend(backend)
 const DTYPE = dtype
+const SWEEP_SIZE = sweep_size
 
 const HAS_GPU = try
     backend == "gpu" && contains(string(Reactant.devices()[1]), "CUDA")
@@ -61,16 +65,27 @@ const EPS_TARGET = T === Float32 ? 1e-6 : 1e-9
 const NTRANS = 1
 const FT_NTHR = max(1, min(Sys.CPU_THREADS, 16))   # cap N-thr at 16 to dodge oversub warnings
 
-# Sweep configuration.
-# Per dimension, fix N; sweep M.
-const SWEEP = [
-    (1, [10_000, 100_000, 1_000_000, 10_000_000], (4096,)),
-    # Two 2D rows: small grid (gather/dot_general bandwidth-bound regime
-    # where M ≫ cells) and large grid (FFT-dominated regime).
-    (2, [10_000, 100_000, 1_000_000],             (128, 128)),
-    (2, [10_000, 100_000, 1_000_000],             (1024, 1024)),
-    (3, [10_000, 100_000, 1_000_000],             (128, 128, 128)),
-]
+# Sweep configuration. Per dimension, fix N; sweep M.
+# `--small` caps M at 1e5 and N at 1024/axis (drops the 4096 1D row,
+# the M=1e6/1e7 columns, and any larger 2D grid). Used for tighter-eps
+# (1e-9 / Float64) investigations where the full grid is overkill.
+const SWEEP = if SWEEP_SIZE == "small"
+    [
+        (1, [10_000, 100_000],                        (1024,)),
+        (2, [10_000, 100_000],                        (128, 128)),
+        (2, [10_000, 100_000],                        (1024, 1024)),
+        (3, [10_000, 100_000],                        (128, 128, 128)),
+    ]
+else
+    [
+        (1, [10_000, 100_000, 1_000_000, 10_000_000], (4096,)),
+        # Two 2D rows: small grid (gather/dot_general bandwidth-bound regime
+        # where M ≫ cells) and large grid (FFT-dominated regime).
+        (2, [10_000, 100_000, 1_000_000],             (128, 128)),
+        (2, [10_000, 100_000, 1_000_000],             (1024, 1024)),
+        (3, [10_000, 100_000, 1_000_000],             (128, 128, 128)),
+    ]
+end
 
 # ---- timing helpers --------------------------------------------------------
 function timed_p10(f::F; nrep::Int=51, warmup::Int=30) where {F}
