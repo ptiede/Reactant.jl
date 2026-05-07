@@ -18,10 +18,19 @@ using ReactantNUFFT
 
 # ---- args ------------------------------------------------------------------
 backend = "gpu"
+dtype = "f32"
+out_path = "/tmp/scaling.csv"
 for a in ARGS
-    startswith(a, "--backend=") && (global backend = String(split(a, "=")[2]))
+    if startswith(a, "--backend=")
+        global backend = String(split(a, "=")[2])
+    elseif startswith(a, "--dtype=")
+        global dtype = lowercase(String(split(a, "=")[2]))
+    elseif startswith(a, "--out=")
+        global out_path = String(split(a, "=")[2])
+    end
 end
 Reactant.set_default_backend(backend)
+const DTYPE = dtype
 
 const HAS_GPU = try
     backend == "gpu" && contains(string(Reactant.devices()[1]), "CUDA")
@@ -47,8 +56,8 @@ else
     false
 end
 
-const T = Float32
-const EPS_TARGET = 1e-6
+const T = DTYPE == "f64" ? Float64 : Float32
+const EPS_TARGET = T === Float32 ? 1e-6 : 1e-9
 const NTRANS = 1
 const FT_NTHR = max(1, min(Sys.CPU_THREADS, 16))   # cap N-thr at 16 to dodge oversub warnings
 
@@ -103,7 +112,7 @@ function finufft_time(D::Int, M::Int, nmodes, K::Int, nthreads::Int)
     in_shape_M  = NTRANS == 1 ? (M,) : (M, NTRANS)
     in_shape_fk = NTRANS == 1 ? nmodes : (nmodes..., NTRANS)
     plan = FINUFFT.finufft_makeplan(K, collect(Int64, nmodes), -1, NTRANS, EPS_TARGET;
-        dtype=Float32, nthreads=nthreads,
+        dtype=T, nthreads=nthreads,
     )
     try
         if D == 1
@@ -143,7 +152,7 @@ function cufinufft_time(D::Int, M::Int, nmodes, K::Int)
     in_shape_M  = NTRANS == 1 ? (M,) : (M, NTRANS)
     in_shape_fk = NTRANS == 1 ? nmodes : (nmodes..., NTRANS)
     plan = FINUFFT.cufinufft_makeplan(K, collect(Int64, nmodes), -1, NTRANS, EPS_TARGET;
-        dtype=Float32,
+        dtype=T,
     )
     try
         if D == 1
@@ -179,9 +188,9 @@ function cufinufft_time(D::Int, M::Int, nmodes, K::Int)
 end
 
 # ---- driver ----------------------------------------------------------------
-const OUT = "/tmp/scaling.csv"
+const OUT = out_path
 open(OUT, "w") do io
-    println(io, "D,M,N,K,lib,time_ms")
+    println(io, "D,M,N,K,lib,time_ms,dtype")
     flush(io)
     for (D, Ms, nmodes) in SWEEP
         Nlabel = D == 1 ? string(nmodes[1]) :
@@ -194,7 +203,7 @@ open(OUT, "w") do io
             tF1 = try finufft_time(D, M, nmodes, K, 1) catch e; @warn "FINUFFT-1 $tag: $e"; NaN end
             tFN = try finufft_time(D, M, nmodes, K, FT_NTHR) catch e; @warn "FINUFFT-N $tag: $e"; NaN end
             for (lib, t) in (("Reactant", tR), ("cuFINUFFT", tC), ("FINUFFT-1", tF1), ("FINUFFT-$FT_NTHR", tFN))
-                println(io, "$D,$M,$Nlabel,$K,$lib,$(1000*t)")
+                println(io, "$D,$M,$Nlabel,$K,$lib,$(1000*t),$DTYPE")
             end
             flush(io)
             @printf("%s  R=%.3f cuF=%.3f F1=%.3f F%d=%.3f ms\n",

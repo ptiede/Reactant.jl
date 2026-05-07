@@ -137,8 +137,7 @@ function nufft_type1(
     T = _real_eltype(points[1])
     plan = plan_nufft(T, 1, nmodes; iflag, kwargs...)
     prep = set_nufft_points(plan, points)
-    c_dev = _to_device_complex(T, c)
-    return execute_nufft(prep, c_dev)
+    return execute_nufft(prep, c)
 end
 
 nufft_type1(x::AbstractVector, c::AbstractArray, n::Integer; kwargs...) =
@@ -160,22 +159,8 @@ function nufft_type2(
     T = _real_eltype(points[1])
     plan = plan_nufft(T, 2, nmodes; iflag, kwargs...)
     prep = set_nufft_points(plan, points)
-    fk_dev = _to_device_complex(T, fk)
-    return execute_nufft(prep, fk_dev)
+    return execute_nufft(prep, fk)
 end
 
 nufft_type2(x::AbstractVector, fk::AbstractVector; kwargs...) = nufft_type2((x,), fk)
 
-# Promote to a Complex{T}-eltype array. Leaves traced arrays alone (just
-# eltype-broadcasts inside the trace if needed) so this works in any
-# tracing context.
-function _to_device_complex(::Type{T}, c::AbstractArray) where {T<:Real}
-    CT = Complex{T}
-    if c isa Reactant.AnyTracedRArray
-        return eltype(c) === CT ? c : CT.(c)
-    end
-    if c isa Reactant.AbstractConcreteArray
-        return eltype(c) === CT ? c : Reactant.to_rarray(convert(Array{CT}, Array(c)))
-    end
-    return Reactant.to_rarray(convert(Array{CT}, collect(c)))
-end

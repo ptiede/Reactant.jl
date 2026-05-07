@@ -147,7 +147,6 @@ function stage_t1_spread(prep, c)
     plan = prep.plan
     T = eltype(plan)
     D = RN.ndims_(prep)
-    CT = Complex{T}
     w = plan.nspread
     ngrid = plan.ngrid
     nchunks = prep.nchunks
@@ -157,12 +156,14 @@ function stage_t1_spread(prep, c)
 
     coefs = Reactant.promote_to(Reactant.TracedRArray{T,2}, plan.horner_coefs)
     offsets_row = reshape(collect(0:(w - 1)), 1, w)
-    fw = Reactant.Ops.@opcall fill(zero(CT), Int64[ngrid..., ntrans])
-    return RN._spread_chunks(
-        fw, cmat, prep.perm, prep.mask,
+    fw_re = similar(cmat, T, ngrid..., ntrans)
+    fw_im = similar(cmat, T, ngrid..., ntrans)
+    fw_re, fw_im = RN._spread_chunks(
+        fw_re, fw_im, cmat, prep.perm, prep.mask,
         prep.base_sorted, prep.frac_sorted, coefs,
         ngrid, w, ntrans, nchunks, cs, offsets_row, Val(D),
     )
+    return complex.(fw_re, fw_im)
 end
 
 function stage_t1_fft(prep, fw)

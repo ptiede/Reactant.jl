@@ -280,6 +280,13 @@ function _gather_sum_traced(
     fw, idx_per_dim::NTuple{3}, wpd::NTuple{3},
     M_pad::Int, w::Int, ntrans::Int, ::Val{3},
 )
+    # The wide-gather pattern that wins for D=2 (w²=49) does not transfer:
+    # at D=3 w=7 means w³=343 cells per point, the gather materializes a
+    # M·w³·ntrans intermediate (~2.7 GB at M=10⁶, ComplexF32) that's
+    # DRAM-bound, and the trace-time unroll of 343 broadcast mul-adds
+    # blows the register file (ptxas reports ~500 B spill stores/loads).
+    # Empirically 20–30% slower than the scalar @trace-for path below at
+    # M ∈ {10⁵, 10⁶}.
     out = similar(fw, eltype(fw), (M_pad, ntrans))
     fill!(out, zero(eltype(fw)))
     idx1, idx2, idx3 = idx_per_dim

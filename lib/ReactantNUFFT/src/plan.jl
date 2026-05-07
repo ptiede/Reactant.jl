@@ -26,7 +26,6 @@ struct NUFFTPlan{T<:Real,D,K}
     bin_dims::NTuple{D,Int}
     nbins::NTuple{D,Int}
     chunk_size::Int
-    sort::Bool                        # final, resolved sort flag
     horner_coefs::Matrix{T}           # (w, deg+1)
     phi_hat::NTuple{D,Vector{T}}      # length nmodes[d] each
 end
@@ -109,7 +108,6 @@ function plan_nufft(
     nsp   = Int(get(kwargs, :nspread,  opts.nspread))
     cz    = Int(get(kwargs, :chunk_size, opts.chunk_size))
     bd_in =      get(kwargs, :bin_dims,  opts.bin_dims)
-    sort_ =      get(kwargs, :sort,      opts.sort)
 
     if nsp < 0
         nsp = _nspread_for_eps(T, eps_, sigma)
@@ -128,12 +126,6 @@ function plan_nufft(
     end
     nb = ntuple(d -> max(1, cld(ngrid_t[d], bd[d])), D)
 
-    sort_resolved = if K == 1
-        true                              # always sort for type-1, like cuFINUFFT
-    else
-        sort_ === :never ? false : true  # :auto and :always ⇒ sort
-    end
-
     beta = expsemicircle_beta(T, nsp, sigma)
     coefs = horner_coefficients(T, nsp, sigma)
     phih  = ntuple(d -> phi_hat_1d(T, nsp, sigma, ngrid_t[d], modes_t[d]), D)
@@ -143,7 +135,7 @@ function plan_nufft(
         ngrid_t,
         iflag >= 0 ? 1 : -1,
         eps_, sigma, nsp, beta,
-        bd, nb, cz, sort_resolved,
+        bd, nb, cz,
         coefs, phih,
     )
 end

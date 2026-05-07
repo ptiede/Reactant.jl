@@ -10,14 +10,12 @@ chunked-scatter strategy.
 Configuration knobs that don't depend on the runtime point distribution.
 
 # Fields
-- `eps::T`                — target tolerance (default `1e-6` for `Float32`).
+- `eps::T`                — target tolerance (default `1e-6`).
 - `sigma::T`              — oversampling factor (default 2.0; 1.25 supported).
 - `nspread::Int`          — kernel half-width `w`. If `< 0`, picked from `eps`.
-- `chunk_size::Int`       — points per `@trace for` chunk in execute. Default 65536.
+- `chunk_size::Int`       — points per spread chunk. Default 65536.
 - `bin_dims::NTuple{D,Int}` or `NTuple{0,Int}` — bin width per dim used
   to define the sort order; `()` means "auto" (heuristic per dim).
-- `sort::Symbol`          — `:auto`, `:always`, or `:never`. For type-1 we always
-  sort regardless (mirrors cuFINUFFT). For type-2, `:auto` ⇒ sort.
 """
 Base.@kwdef struct NUFFTOptions{T<:Real}
     eps::T = T(1.0e-6)
@@ -25,7 +23,6 @@ Base.@kwdef struct NUFFTOptions{T<:Real}
     nspread::Int = -1                  # < 0 ⇒ derive from eps
     chunk_size::Int = 65536
     bin_dims::Tuple = ()               # () ⇒ auto
-    sort::Symbol = :auto
 end
 
 # Convenience constructor with auto-promotion.
@@ -35,10 +32,9 @@ function NUFFTOptions(::Type{T};
     nspread::Integer=-1,
     chunk_size::Integer=65536,
     bin_dims::Tuple=(),
-    sort::Symbol=:auto,
 ) where {T<:Real}
     return NUFFTOptions{T}(
-        T(eps), T(sigma), Int(nspread), Int(chunk_size), bin_dims, sort
+        T(eps), T(sigma), Int(nspread), Int(chunk_size), bin_dims
     )
 end
 

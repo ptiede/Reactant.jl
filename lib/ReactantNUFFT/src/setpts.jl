@@ -1,13 +1,9 @@
 #==============================================================================
 set_nufft_points: bin-sort + per-dim base index / fractional offset.
 
-Mirrors cuFINUFFT setpts conceptually:
-- type-1: always sort (sort policy is forced in the plan).
-- type-2: sort by default; opt out via opts.sort=:never.
-
-This compiles a single Reactant function whose body is plain Julia: wrap to
-[0, 2pi), scale to the oversampled grid, take floor/frac, build a bin index,
-`sortperm`, then `getindex` to permute the per-dim arrays. No `@opcall` calls.
+Mirrors cuFINUFFT setpts: wrap to [0, 2pi), scale to the oversampled grid,
+take floor/frac, build a bin index, `sortperm`, then `getindex` to permute
+the per-dim arrays. Plain Julia traced through Reactant — no `@opcall`.
 ==============================================================================#
 
 """
@@ -40,8 +36,8 @@ Base.eltype(::NUFFTSetPts{T}) where {T} = T
 # --- Traced kernel ---------------------------------------------------------
 
 # Compute the bin-sort permutation, sorted base/frac per dim, then PAD all
-# per-point arrays out to M_pad so the execute @trace for sees a static
-# slice size. Padded entries are zeroed at execute via `mask`.
+# per-point arrays out to M_pad so the execute path sees a static slice
+# size. Padded entries are zeroed at execute via `mask`.
 #
 # All arithmetic is plain Julia, traced through Reactant.
 function _setpts_traced(
@@ -50,7 +46,6 @@ function _setpts_traced(
     nspread::Int,
     bin_dims::NTuple{D,Int},
     nbins::NTuple{D,Int},
-    do_sort::Bool,
     M_pad::Int,
 ) where {D}
     M = length(points[1])
@@ -62,23 +57,16 @@ function _setpts_traced(
     base = ntuple(d -> floor.(Int, s[d]) .- half_w_offset, Val(D))
     frac = ntuple(d -> s[d] .- floor.(s[d]), Val(D))
 
-    if do_sort
-        stride = 1
-        bin_id = mod.(base[1], ngrid[1]) .÷ bin_dims[1]
-        for d in 2:D
-            stride *= nbins[d - 1]
-            bin_id = bin_id .+ (mod.(base[d], ngrid[d]) .÷ bin_dims[d]) .* stride
-        end
-        perm = sortperm(bin_id)
-        invp = sortperm(perm)
-        base_s = ntuple(d -> base[d][perm], Val(D))
-        frac_s = ntuple(d -> frac[d][perm], Val(D))
-    else
-        perm = collect(1:M)
-        invp = collect(1:M)
-        base_s = base
-        frac_s = frac
+    stride = 1
+    bin_id = mod.(base[1], ngrid[1]) .÷ bin_dims[1]
+    for d in 2:D
+        stride *= nbins[d - 1]
+        bin_id = bin_id .+ (mod.(base[d], ngrid[d]) .÷ bin_dims[d]) .* stride
     end
+    perm = sortperm(bin_id)
+    invp = sortperm(perm)
+    base_s = ntuple(d -> base[d][perm], Val(D))
+    frac_s = ntuple(d -> frac[d][perm], Val(D))
 
     # Pad to M_pad with sentinel values: perm→1, base→1, frac→0.
     # Padding entries' contributions are killed by `mask`.
@@ -134,10 +122,9 @@ function set_nufft_points(
     chunk_size = cld(M, nchunks)
     M_pad = nchunks * chunk_size
 
-    pts = ntuple(d -> _to_device(T, points[d]), Val(D))
 
     perm, invp, base_s, frac_s, mask = _setpts_traced(
-        pts, plan.ngrid, plan.nspread, plan.bin_dims, plan.nbins, plan.sort, M_pad,
+        points, plan.ngrid, plan.nspread, plan.bin_dims, plan.nbins, M_pad,
     )
 
     return NUFFTSetPts{
@@ -145,15 +132,4 @@ function set_nufft_points(
     }(
         plan, M, M_pad, nchunks, chunk_size, perm, invp, base_s, frac_s, mask,
     )
-end
-
-# Helpers — leave traced arrays alone; convert plain host arrays only.
-function _to_device(::Type{T}, x::AbstractVector) where {T<:Real}
-    if x isa Reactant.AnyTracedRArray
-        return eltype(x) === T ? x : T.(x)
-    end
-    if x isa Reactant.AbstractConcreteArray
-        return eltype(x) === T ? x : Reactant.to_rarray(convert(Vector{T}, Array(x)))
-    end
-    return Reactant.to_rarray(convert(Vector{T}, collect(x)))
 end

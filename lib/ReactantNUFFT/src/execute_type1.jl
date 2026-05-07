@@ -70,7 +70,6 @@ end
 @inline function _stack_scatter_indices(idxs::NTuple{3,AbstractMatrix})
     M, w = size(idxs[1])
     z = zero(eltype(idxs[1]))
-    one4 = z .* reshape(idxs[1], 1, 1, 1, 1)  # placeholder; broadcast adds elide it
     a = reshape(idxs[1], M, w, 1, 1) .+
         z .* reshape(idxs[2], M, 1, w, 1) .+
         z .* reshape(idxs[3], M, 1, 1, w)
@@ -86,41 +85,16 @@ end
 
 # ---------- the scatter call ------------------------------------------------
 #
-# fw layout: (Nf_1, ..., Nf_D, ntrans). Updates: (Nupdates, ntrans). Indices:
-# (Nupdates, D). The window dim of updates is the trailing ntrans axis.
-function _scatter_add_spatial!(
-    fw::Reactant.AnyTracedRArray{CT,Dp1},
-    scatter_idx::AbstractMatrix,
-    updates::AbstractMatrix,
-    ::Val{D},
-) where {CT,Dp1,D}
-    @assert Dp1 == D + 1
-    # Note on hints: `indices_are_sorted=true` was tried (post-bin-sort indices
-    # are clustered but not strictly lex-sorted). It's a no-op on XLA-CPU and
-    # ~7× SLOWER on XLA-GPU at 2D M=10⁶ N=1024² (XLA-GPU picks a sequential
-    # code path when the contract is asserted). `unique_indices=false` is the
-    # truthful value (multiple updates target the same fw cell) and matches
-    # the default, so we don't pass it explicitly.
-    res = Reactant.Ops.@opcall scatter(
-        +,
-        [fw],
-        Reactant.promote_to(Reactant.TracedRArray{Int,2}, scatter_idx),
-        [Reactant.promote_to(Reactant.TracedRArray{CT,2}, updates)];
-        update_window_dims=Int64[2],                       # ntrans axis of updates
-        inserted_window_dims=collect(Int64, 1:D),          # spatial dims of fw
-        input_batching_dims=Int64[],
-        scatter_indices_batching_dims=Int64[],
-        scatter_dims_to_operand_dims=collect(Int64, 1:D),  # idx rows → spatial dims
-        index_vector_dim=Int64(1),                          # (D, N) layout — see _stack_scatter_indices
-    )
-    return only(res)
-end
-
-# Real-valued single-operand scatter — twin of `_scatter_add_spatial!` but
-# for fp32 (not complex) operands. Used by the split-re/im spread variant
-# (option A) so each axis (real, imag) is a plain real scatter; this keeps
-# the output layout in the FFT-input shape and avoids the post-scatter
-# layout transpose that the complex-scatter path provokes.
+# Real-valued single-operand scatter. The spread path scatters real and imag
+# parts separately into two `(ngrid..., ntrans)` real tensors, recombining
+# via `complex.(re, im)` immediately before the FFT. Going through complex
+# scatter directly forces XLA to insert a 32 MB layout-transpose between
+# scatter and FFT (~187 µs / call on D=2 M=10⁶ N=1024² T1, DRAM-bound);
+# the split keeps both tensors in the FFT-input layout.
+#
+# Note on `indices_are_sorted`: bin-sorted indices are clustered but not
+# strictly lex-sorted. Asserting the hint is a no-op on XLA-CPU and ~7×
+# SLOWER on XLA-GPU (it picks a sequential code path), so we don't pass it.
 function _scatter_add_real!(
     fw, scatter_idx::AbstractMatrix, updates::AbstractMatrix, ::Val{D},
 ) where {D}
@@ -130,12 +104,12 @@ function _scatter_add_real!(
         [Reactant.promote_to(Reactant.TracedRArray{T,D + 1}, fw)],
         Reactant.promote_to(Reactant.TracedRArray{Int,2}, scatter_idx),
         [Reactant.promote_to(Reactant.TracedRArray{T,2}, updates)];
-        update_window_dims=Int64[2],
-        inserted_window_dims=collect(Int64, 1:D),
+        update_window_dims=Int64[2],                       # ntrans axis of updates
+        inserted_window_dims=collect(Int64, 1:D),          # spatial dims of fw
         input_batching_dims=Int64[],
         scatter_indices_batching_dims=Int64[],
-        scatter_dims_to_operand_dims=collect(Int64, 1:D),
-        index_vector_dim=Int64(1),
+        scatter_dims_to_operand_dims=collect(Int64, 1:D),  # idx rows → spatial dims
+        index_vector_dim=Int64(1),                          # (D, N) layout — see _stack_scatter_indices
     )
     return only(res)
 end
@@ -224,36 +198,17 @@ function _execute_type1_impl(
     #    inside `_spread_chunks` rather than via an upfront materialized
     #    `c_sorted = cmat[perm, :] .* mask` — keeping the gather in the same
     #    op group as the contribution build lets XLA fuse them and avoids
-    #    a (M_pad, ntrans) intermediate that costs ~25–35 % of e2e on the
-    #    M=10⁶ T1 rows. (See PROFILE.md "Largest gaps" → B2.)
-    #
-    #    When `SPLIT_RE_IM_SPREAD[]` is true (default), we scatter into two
-    #    separate real-valued fw tensors (real & imag) and only recombine
-    #    with `complex(re, im)` immediately before the FFT. XLA's lowering
-    #    of complex `scatter` previously inserted a 32 MB layout-transpose
-    #    between scatter and FFT (~187 µs on D=2 M=10⁶ N=1024² T1 — a
-    #    DRAM-bound step that cost ~3 ms/transform). Splitting up front
-    #    lets XLA put the real & imag tensors in the FFT-input layout
-    #    directly, eliding that transpose.
+    #    a (M_pad, ntrans) intermediate that costs ~25–35% of e2e at M=10⁶.
     coefs = Reactant.promote_to(Reactant.TracedRArray{T,2}, plan.horner_coefs)
     offsets_row = reshape(collect(0:(w - 1)), 1, w)         # static (1, w) Int row
-    if SPLIT_RE_IM_SPREAD[]
-        fw_re = similar(cmat, real(eltype(cmat)), ngrid..., ntrans)
-        fw_im = similar(cmat, real(eltype(cmat)), ngrid..., ntrans)
-        fw_re, fw_im = _spread_chunks_split(
-            fw_re, fw_im, cmat, prep.perm, prep.mask,
-            prep.base_sorted, prep.frac_sorted, coefs,
-            ngrid, w, ntrans, nchunks, cs, offsets_row, Val(D),
-        )
-        fw = complex.(fw_re, fw_im)
-    else
-        fw = similar(cmat, ngrid..., ntrans)
-        fw = _spread_chunks(
-            fw, cmat, prep.perm, prep.mask,
-            prep.base_sorted, prep.frac_sorted, coefs,
-            ngrid, w, ntrans, nchunks, cs, offsets_row, Val(D),
-        )
-    end
+    fw_re = similar(cmat, real(eltype(cmat)), ngrid..., ntrans)
+    fw_im = similar(cmat, real(eltype(cmat)), ngrid..., ntrans)
+    fw_re, fw_im = _spread_chunks(
+        fw_re, fw_im, cmat, prep.perm, prep.mask,
+        prep.base_sorted, prep.frac_sorted, coefs,
+        ngrid, w, ntrans, nchunks, cs, offsets_row, Val(D),
+    )
+    fw = complex.(fw_re, fw_im)
 
     # 2. FFT (sign per iflag).
     fw_hat = plan.iflag < 0 ?
@@ -274,57 +229,18 @@ end
 #
 # Each iteration computes Horner weights, multi-D stencil indices, and a
 # contribution tensor of shape (chunk_size, w^D, ntrans), then scatter-adds
-# it into `fw`. With bin-sorted ordering, each chunk's scatter targets are
-# spatially localized.
+# it into the (real, imag) tensor pair. With bin-sorted ordering, each
+# chunk's scatter targets are spatially localized.
+#
+# Static unroll — for our target sweep nchunks ≤ ~16 so the IR stays
+# bounded. Larger M (10⁷) would benefit from a `@trace for` loop, but
+# that path runs into loop-carried-state issues with the scatter pattern.
 function _spread_chunks(
-    fw, cmat, perm, mask, base_full, frac_full, coefs,
-    ngrid::NTuple{ND,Int}, w::Int, ntrans::Int,
-    nchunks::Int, cs::Int, offsets_row::AbstractMatrix, dimval::Val{ND},
-) where {ND}
-    nd = ND
-    wD = w^nd
-    # Static unroll — for our target VLBI sweep nchunks ≤ ~16 so the IR stays
-    # bounded. Larger M (10^7) would benefit from a `@trace for` loop, but
-    # that path runs into loop-carried-state issues with our scatter pattern.
-    for k in 1:nchunks
-        j0 = (k - 1) * cs + 1
-        bs = ntuple(d -> base_full[d][j0:(j0 + cs - 1)], dimval)
-        fr = ntuple(d -> frac_full[d][j0:(j0 + cs - 1)], dimval)
-        cc = _gather_chunk_strengths(cmat, perm, mask, j0, cs)
-
-        wpd   = ntuple(d -> _per_dim_weights(coefs, fr[d]), dimval)
-        idxpd = ntuple(d -> _per_dim_indices(bs[d], ngrid[d], offsets_row), dimval)
-        weights = _outer_product_weights(wpd)               # (cs, wD)
-        scatter_idx = _stack_scatter_indices(idxpd)         # (nd, cs*wD)
-
-        contrib = reshape(weights, cs, wD, 1) .* reshape(cc, cs, 1, ntrans)
-        contrib_flat = reshape(contrib, cs * wD, ntrans)
-
-        fw = _scatter_add_spatial!(fw, scatter_idx, contrib_flat, dimval)
-    end
-    return fw
-end
-
-# Per-chunk strength gather + mask. Replaces the upfront
-# `c_sorted = cmat[perm, :] .* mask` materialization (B2).
-@inline function _gather_chunk_strengths(cmat, perm, mask, j0, cs::Int)
-    perm_slice = perm[j0:(j0 + cs - 1)]         # (cs,) Int — bin-sorted source rows
-    mask_slice = mask[j0:(j0 + cs - 1)]         # (cs,)     — pad-row mask
-    cc_un = cmat[perm_slice, :]                 # (cs, ntrans) — gather original strengths
-    return cc_un .* reshape(mask_slice, cs, 1)
-end
-
-# Split-real/imag chunked spread. Mirrors `_spread_chunks` but writes into
-# a pair of real-valued `(ngrid..., ntrans)` tensors instead of one complex
-# tensor. Real and imag updates derived from the same complex `cc` are
-# scattered together via `_scatter_add_spatial_pair!`.
-function _spread_chunks_split(
     fw_re, fw_im, cmat, perm, mask, base_full, frac_full, coefs,
     ngrid::NTuple{ND,Int}, w::Int, ntrans::Int,
     nchunks::Int, cs::Int, offsets_row::AbstractMatrix, dimval::Val{ND},
 ) where {ND}
-    nd = ND
-    wD = w^nd
+    wD = w^ND
     for k in 1:nchunks
         j0 = (k - 1) * cs + 1
         bs = ntuple(d -> base_full[d][j0:(j0 + cs - 1)], dimval)
@@ -334,11 +250,9 @@ function _spread_chunks_split(
         wpd   = ntuple(d -> _per_dim_weights(coefs, fr[d]), dimval)
         idxpd = ntuple(d -> _per_dim_indices(bs[d], ngrid[d], offsets_row), dimval)
         weights = _outer_product_weights(wpd)               # real (cs, wD)
-        scatter_idx = _stack_scatter_indices(idxpd)         # (nd, cs*wD)
+        scatter_idx = _stack_scatter_indices(idxpd)         # (ND, cs*wD)
 
-        # contrib_re/contrib_im are real (cs, wD, ntrans) tensors derived
-        # from the same weights × cc product. Splitting cc into real/imag
-        # avoids a complex multiply: the kernel weights are real.
+        # Splitting cc into real/imag keeps the kernel multiply real.
         cc_re = real.(cc)
         cc_im = imag.(cc)
         contrib_re = reshape(weights, cs, wD, 1) .* reshape(cc_re, cs, 1, ntrans)
@@ -352,27 +266,13 @@ function _spread_chunks_split(
     return fw_re, fw_im
 end
 
-# Toggle for the split-real/imag spread variant (option A — see B5 in
-# PROFILE.md "Largest gaps"). When true, the chunked scatter writes into
-# two separate real-valued `(ngrid..., ntrans)` tensors and only
-# recombines via `complex(re, im)` immediately before the FFT. The point
-# is to elide the 32 MB pre-FFT layout-transpose that XLA inserts when a
-# complex `scatter` output meets `stablehlo.fft` (≈ 187 µs / call,
-# DRAM-saturated, observed on D=2 M=10⁶ N=1024² T1). Toggle off only for
-# A/B benchmarking against the complex-scatter fallback.
-const SPLIT_RE_IM_SPREAD = Ref(true)
-
-# Removed experiments — kept here as breadcrumbs in case future workloads
-# motivate re-investigating:
-#
-# • fw replication (B3): tuple-of-shards, round-robin chunks across R
-#   shards, reduce-sum at the end. Empirically flat-to-worse than R=1 on
-#   every loss row (DRAM-bandwidth bound, not contention bound). If
-#   revisiting, use a single dense `(ngrid..., ntrans, R)` tensor with
-#   the R index baked into scatter_dims_to_operand_dims, not a tuple.
-#
-# • Sort-merge spread: per-chunk `sortperm` of linear destination index
-#   then 1-D scatter with `indices_are_sorted=true`. ~7× SLOWER on
-#   XLA-GPU than the default scatter-add path at 2D M=10⁶ N=1024²
-#   (XLA-GPU picks a sequential code path under that hint).
+# Per-chunk strength gather + mask. Replaces an upfront
+# `c_sorted = cmat[perm, :] .* mask` materialization that costs ~25–35%
+# of e2e on M=10⁶ T1 rows.
+@inline function _gather_chunk_strengths(cmat, perm, mask, j0, cs::Int)
+    perm_slice = perm[j0:(j0 + cs - 1)]         # (cs,) Int — bin-sorted source rows
+    mask_slice = mask[j0:(j0 + cs - 1)]         # (cs,)     — pad-row mask
+    cc_un = cmat[perm_slice, :]                 # (cs, ntrans) — gather original strengths
+    return cc_un .* reshape(mask_slice, cs, 1)
+end
 
