@@ -139,6 +139,14 @@ for (aT, iT) in (
     end
 end
 
+# Base's `lerpi` only accepts plain `Integer`s and converts its result to the endpoint
+# type, which a traced position cannot do; the result stays traced and the `getindex`
+# methods above convert it.
+function Base.lerpi(j::TracedRNumber{<:Integer}, d::Integer, a::T, b::T) where {T}
+    t = j / d
+    return (oneunit(t) - t) * a + t * b
+end
+
 # v1.10 specific ambiguity fixes
 function Base.getindex(
     a::Union{LinRange{TracedRNumber{T}},StepRangeLen{TracedRNumber{T}}}, index::Int
